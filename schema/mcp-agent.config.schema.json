@@ -414,6 +414,26 @@
       "title": "MCPSettings",
       "type": "object"
     },
+    "GeminiSettings": {
+      "additionalProperties": true,
+      "description": "Settings for using Gemini models in the MCP Agent application.",
+      "properties": {
+        "api_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Api Key"
+        }
+      },
+      "title": "GeminiSettings",
+      "type": "object"
+    },
     "OpenAISettings": {
       "additionalProperties": true,
       "description": "Settings for using OpenAI models in the MCP Agent application.",
@@ -750,6 +770,18 @@
       ],
       "default": null,
       "description": "Settings for using Cohere models in the MCP Agent application"
+    },
+    "gemini": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GeminiSettings"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Settings for using Gemini models in the MCP Agent application"
     },
     "openai": {
       "anyOf": [

@@ -100,3 +100,6 @@ openai:
 
 
 anthropic:
+
+gemini:
+  default_model: "gemini-1.5-flash"

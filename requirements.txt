@@ -3,6 +3,7 @@ aiohttp>=3.8.0
 anthropic
 asyncio-mqtt
 docling
+google-generativeai
 mcp-agent
 mcp-server-git
 nest_asyncio

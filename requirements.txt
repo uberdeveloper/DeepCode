@@ -4,6 +4,7 @@ anthropic
 asyncio-mqtt
 docling
 google-generativeai
+instructor
 mcp-agent
 mcp-server-git
 nest_asyncio

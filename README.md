@@ -462,9 +462,13 @@ curl -O https://raw.githubusercontent.com/HKUDS/DeepCode/main/mcp_agent.config.y
 curl -O https://raw.githubusercontent.com/HKUDS/DeepCode/main/mcp_agent.secrets.yaml
 
 # 🔑 Configure API keys (required)
-# Edit mcp_agent.secrets.yaml with your API keys and base_url:
-# - openai: api_key, base_url (for OpenAI/custom endpoints)
+# Edit mcp_agent.secrets.yaml with your API keys and base_url.
+# The agent will automatically select the LLM based on the available API keys.
+# The priority is Gemini > Anthropic > OpenAI.
+
+# - gemini: api_key (for Google Gemini models)
 # - anthropic: api_key (for Claude models)
+# - openai: api_key, base_url (for OpenAI/custom endpoints)
 
 # 🔑 Configure search API keys for web search (optional)
 # Edit mcp_agent.config.yaml to set your API keys:

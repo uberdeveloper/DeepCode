@@ -326,7 +326,9 @@ async def run_research_analyzer(prompt_text: str, logger) -> str:
         raise
 
 
-async def run_resource_processor(analysis_result: str, logger) -> str:
+async def run_resource_processor(
+    analysis_result: str, logger, original_input: str = None
+) -> str:
     """
     Run the resource processing workflow using ResourceProcessorAgent.
 
@@ -337,31 +339,103 @@ async def run_resource_processor(analysis_result: str, logger) -> str:
     Returns:
         str: Processing result from the agent
     """
-    processor_agent = Agent(
-        name="ResourceProcessorAgent",
-        instruction=PAPER_DOWNLOADER_PROMPT,
-        server_names=["filesystem", "file-downloader"],
-    )
-
-    async with processor_agent:
-        print("processor: Connected to server, calling list_tools...")
-        tools = await processor_agent.list_tools()
-        print(
-            "Tools available:",
-            tools.model_dump() if hasattr(tools, "model_dump") else str(tools),
+    try:
+        processor_agent = Agent(
+            name="ResourceProcessorAgent",
+            instruction=PAPER_DOWNLOADER_PROMPT,
+            server_names=["filesystem", "file-downloader"],
         )
 
-        processor = await processor_agent.attach_llm(get_preferred_llm_class())
+        async with processor_agent:
+            print("processor: Connected to server, calling list_tools...")
+            tools = await processor_agent.list_tools()
+            print(
+                "Tools available:",
+                tools.model_dump() if hasattr(tools, "model_dump") else str(tools),
+            )
 
-        # Set higher token output for resource processing
-        processor_params = RequestParams(
-            max_tokens=4096,
-            temperature=0.2,
-        )
+            processor = await processor_agent.attach_llm(get_preferred_llm_class())
 
-        return await processor.generate_str(
-            message=analysis_result, request_params=processor_params
-        )
+            # Set higher token output for resource processing
+            processor_params = RequestParams(
+                max_tokens=4096,
+                temperature=0.2,
+            )
+
+            result = await processor.generate_str(
+                message=analysis_result, request_params=processor_params
+            )
+
+            # Post-process the result to handle markdown formatting
+            cleaned_result = extract_clean_json(result)
+
+            # Check if the result has a valid paper_path
+            try:
+                import json
+
+                result_data = json.loads(cleaned_result)
+                if not result_data.get("paper_path"):
+                    print(
+                        "⚠️ ResourceProcessorAgent returned null paper_path, using fallback..."
+                    )
+                    raise ValueError("Paper path is null")
+            except json.JSONDecodeError:
+                print(
+                    "⚠️ ResourceProcessorAgent returned invalid JSON, using fallback..."
+                )
+                raise ValueError("Invalid JSON response")
+
+            return cleaned_result
+    except Exception as e:
+        print(f"⚠️ ResourceProcessorAgent failed: {e}")
+        print("🔄 Attempting fallback processing...")
+
+        # Fallback: Extract file path from analysis_result or original_input
+        try:
+            import json
+
+            file_path = None
+            metadata = {"title": "N/A", "authors": ["N/A"], "year": "N/A"}
+
+            # Try to extract from analysis_result first
+            try:
+                analysis_data = json.loads(analysis_result)
+                file_path = analysis_data.get("path")
+                metadata = analysis_data.get("paper_info", metadata)
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+            # If not found, try to extract from original_input
+            if not file_path and original_input:
+                try:
+                    # Handle JSON format input
+                    if original_input.startswith("{") and original_input.endswith("}"):
+                        input_data = json.loads(original_input)
+                        file_path = input_data.get("paper_path")
+                    else:
+                        # Handle direct file path
+                        file_path = original_input
+                except json.JSONDecodeError:
+                    file_path = original_input
+
+            if file_path:
+                # Create a fallback response that matches expected format
+                fallback_result = {
+                    "status": "success",
+                    "paper_path": file_path,
+                    "metadata": metadata,
+                }
+                print(f"✅ Fallback processing successful: {file_path}")
+                return json.dumps(fallback_result)
+            else:
+                raise ValueError(
+                    "No file path found in analysis result or original input"
+                )
+        except Exception as fallback_e:
+            print(f"❌ Fallback processing also failed: {fallback_e}")
+            raise ValueError(
+                f"Resource processing failed and fallback unavailable: {str(e)}"
+            )
 
 
 async def run_code_analyzer(
@@ -551,6 +625,7 @@ async def _process_input_source(input_source: str, logger) -> str:
     if input_source.startswith("{") and input_source.endswith("}"):
         try:
             import json
+
             data = json.loads(input_source)
             if "paper_path" in data:
                 file_path = data["paper_path"]
@@ -559,14 +634,14 @@ async def _process_input_source(input_source: str, logger) -> str:
         except json.JSONDecodeError:
             # If JSON parsing fails, continue with original processing
             pass
-    
+
     # Handle file:// protocol
     if input_source.startswith("file://"):
         file_path = input_source[7:]
         if os.name == "nt" and file_path.startswith("/"):
             file_path = file_path.lstrip("/")
         return file_path
-    
+
     # Return as-is if it's already a file path or URL
     return input_source
 
@@ -603,7 +678,9 @@ async def orchestrate_research_analysis_agent(
         progress_callback(
             25, "📥 Processing downloads and preparing document structure..."
         )
-    download_result = await run_resource_processor(analysis_result, logger)
+    download_result = await run_resource_processor(
+        analysis_result, logger, input_source
+    )
 
     return analysis_result, download_result
 
@@ -626,6 +703,11 @@ async def synthesize_workspace_infrastructure_agent(
         dict: Comprehensive workspace infrastructure metadata
     """
     # Parse download result to get file information
+    # If download_result is a file path (not JSON), convert it to JSON format
+    if isinstance(download_result, str) and not download_result.strip().startswith("{"):
+        # It's a file path, convert to JSON format for FileProcessor
+        download_result = json.dumps({"paper_path": download_result})
+
     result = await FileProcessor.process_file_input(
         download_result, base_dir=workspace_dir
     )

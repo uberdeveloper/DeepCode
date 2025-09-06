@@ -316,6 +316,18 @@ class GeminiProvider(AugmentedLLM[GeminiConfig, dict]):
         # Send message directly using the simple API
         response = model.generate_content(message)
 
+        # Check if response has valid content
+        if not response.candidates or not response.candidates[0].content.parts:
+            # Handle empty or filtered responses
+            finish_reason = (
+                response.candidates[0].finish_reason
+                if response.candidates
+                else "unknown"
+            )
+            raise ValueError(
+                f"Gemini API returned empty response. Finish reason: {finish_reason}"
+            )
+
         return response.text
 
     async def generate_structured(

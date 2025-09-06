@@ -1,26 +1,14 @@
 import json
-import functools
-from typing import Any, Dict, Iterable, List, Type, cast
+from typing import List, Type
 
-from pydantic import BaseModel
 import google.generativeai as genai
-from opentelemetry import trace
 
-from mcp_agent.executor.workflow_task import workflow_task
-from mcp_agent.tracing.telemetry import get_tracer, telemetry
+from mcp_agent.tracing.telemetry import get_tracer
 from mcp_agent.tracing.token_tracking_decorator import track_tokens
 from mcp_agent.tracing.semconv import (
     GEN_AI_AGENT_NAME,
     GEN_AI_REQUEST_MODEL,
-    GEN_AI_RESPONSE_FINISH_REASONS,
-    GEN_AI_TOOL_CALL_ID,
-    GEN_AI_TOOL_NAME,
-    GEN_AI_USAGE_INPUT_TOKENS,
-    GEN_AI_USAGE_OUTPUT_TOKENS,
 )
-from mcp_agent.tracing.telemetry import is_otel_serializable
-from mcp_agent.utils.common import ensure_serializable
-from mcp_agent.utils.pydantic_type_serializer import serialize_model, deserialize_model
 from mcp_agent.workflows.llm.augmented_llm import (
     AugmentedLLM,
     MessageTypes,
@@ -29,7 +17,6 @@ from mcp_agent.workflows.llm.augmented_llm import (
     MCPMessageResult,
     ProviderToMCPConverter,
     RequestParams,
-    CallToolResult,
 )
 from mcp_agent.logging.logger import get_logger
 from mcp.types import (
@@ -48,7 +35,7 @@ class GeminiAugmentedLLM(AugmentedLLM[dict, dict]):
         self.provider = "Gemini"
         self.logger = get_logger(f"{__name__}.{self.name}" if self.name else __name__)
 
-        default_model = "gemini-1.5-flash"
+        default_model = "gemini-2.5-flash"
         if hasattr(self.context.config, "gemini") and self.context.config.gemini:
             if hasattr(self.context.config.gemini, "default_model"):
                 default_model = self.context.config.gemini.default_model
@@ -70,7 +57,9 @@ class GeminiAugmentedLLM(AugmentedLLM[dict, dict]):
     @track_tokens()
     async def generate(self, message, request_params: RequestParams | None = None):
         tracer = get_tracer(self.context)
-        with tracer.start_as_current_span(f"{self.__class__.__name__}.{self.name}.generate") as span:
+        with tracer.start_as_current_span(
+            f"{self.__class__.__name__}.{self.name}.generate"
+        ) as span:
             span.set_attribute(GEN_AI_AGENT_NAME, self.agent.name)
 
             params = self.get_request_params(request_params)
@@ -112,7 +101,11 @@ class GeminiAugmentedLLM(AugmentedLLM[dict, dict]):
             response = await chat.send_message_async(user_messages)
 
             while response.candidates[0].finish_reason.name == "TOOL_CODE":
-                tool_calls = [part.function_call for part in response.candidates[0].content.parts if hasattr(part, 'function_call')]
+                tool_calls = [
+                    part.function_call
+                    for part in response.candidates[0].content.parts
+                    if hasattr(part, "function_call")
+                ]
 
                 tool_results = []
                 for tool_call in tool_calls:
@@ -124,7 +117,11 @@ class GeminiAugmentedLLM(AugmentedLLM[dict, dict]):
             if params.use_history:
                 self.history.set(chat.history)
 
-            return [self.type_converter.to_mcp_message_result(response.candidates[0].content)]
+            return [
+                self.type_converter.to_mcp_message_result(
+                    response.candidates[0].content
+                )
+            ]
 
     async def generate_str(self, message, request_params: RequestParams | None = None):
         responses = await self.generate(message=message, request_params=request_params)
@@ -144,9 +141,62 @@ class GeminiAugmentedLLM(AugmentedLLM[dict, dict]):
         return {
             "function_response": {
                 "name": tool_name,
-                "response": {"content": result.content[0].text if result.content else ""},
+                "response": {
+                    "content": result.content[0].text if result.content else ""
+                },
             }
         }
+
+    @track_tokens()
+    async def generate_structured(
+        self,
+        message,
+        response_model: Type[ModelT],
+        request_params: RequestParams | None = None,
+    ) -> ModelT:
+        """Request a structured LLM generation and return the result as a Pydantic model."""
+        tracer = get_tracer(self.context)
+        with tracer.start_as_current_span(
+            f"{self.__class__.__name__}.{self.name}.generate_structured"
+        ) as span:
+            span.set_attribute(GEN_AI_AGENT_NAME, self.agent.name)
+
+            # First generate a string response using the existing generate_str method
+            response_str = await self.generate_str(
+                message=message,
+                request_params=request_params,
+            )
+
+            # Parse the JSON response from Gemini and validate against the Pydantic model
+            try:
+                # Try to parse as JSON first (Gemini might return JSON in markdown)
+                import re
+
+                json_match = re.search(r"\{.*\}", response_str, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(0)
+                    parsed_data = json.loads(json_str)
+                    return response_model(**parsed_data)
+                else:
+                    # If no JSON found, try to parse directly as the model
+                    # This handles cases where Gemini returns plain text that matches the model structure
+                    return response_model(**{"response": response_str})
+
+            except json.JSONDecodeError as e:
+                self.logger.error(f"Failed to parse JSON response from Gemini: {e}")
+                self.logger.error(f"Response content: {response_str}")
+                # Fallback: return a basic response model
+                fallback_data = {
+                    "response": response_str,
+                    "error": "JSON parsing failed",
+                }
+                return response_model(**fallback_data)
+            except Exception as e:
+                self.logger.error(f"Failed to create response model: {e}")
+                # Fallback: return a basic response model
+                fallback_data = {"response": response_str, "error": str(e)}
+                return response_model(**fallback_data)
+
 
 class MCPGeminiTypeConverter(ProviderToMCPConverter[dict, dict]):
     logger = get_logger(__name__)
@@ -180,12 +230,21 @@ class MCPGeminiTypeConverter(ProviderToMCPConverter[dict, dict]):
         if isinstance(content, TextContent):
             parts.append({"text": content.text})
         elif isinstance(content, ImageContent):
-            parts.append({"inline_data": {"mime_type": content.mimeType, "data": content.data}})
+            parts.append(
+                {"inline_data": {"mime_type": content.mimeType, "data": content.data}}
+            )
         elif isinstance(content, EmbeddedResource):
             if isinstance(content.resource, TextResourceContents):
                 parts.append({"text": content.resource.text})
-            else: # BlobResourceContents
-                parts.append({"inline_data": {"mime_type": content.resource.mimeType, "data": content.resource.blob}})
+            else:  # BlobResourceContents
+                parts.append(
+                    {
+                        "inline_data": {
+                            "mime_type": content.resource.mimeType,
+                            "data": content.resource.blob,
+                        }
+                    }
+                )
         elif isinstance(content, str):
             parts.append({"text": content})
         else:
@@ -196,14 +255,24 @@ class MCPGeminiTypeConverter(ProviderToMCPConverter[dict, dict]):
     @classmethod
     def to_mcp_message_result(cls, result: dict) -> MCPMessageResult:
         content_parts = []
-        for part in result.get('parts', []):
-            if hasattr(part, 'text'):
+        for part in result.get("parts", []):
+            if hasattr(part, "text"):
                 content_parts.append(TextContent(type="text", text=part.text))
-            elif hasattr(part, 'inline_data'):
-                cls.logger.warning("Received an image from Gemini, but it will be converted to a string representation.")
-                content_parts.append(ImageContent(type="image", mimeType=part.inline_data.mime_type, data=part.inline_data.data))
+            elif hasattr(part, "inline_data"):
+                cls.logger.warning(
+                    "Received an image from Gemini, but it will be converted to a string representation."
+                )
+                content_parts.append(
+                    ImageContent(
+                        type="image",
+                        mimeType=part.inline_data.mime_type,
+                        data=part.inline_data.data,
+                    )
+                )
             else:
-                cls.logger.warning(f"Received an unknown part from Gemini, it will be converted to a string representation: {part}")
+                cls.logger.warning(
+                    f"Received an unknown part from Gemini, it will be converted to a string representation: {part}"
+                )
                 content_parts.append(TextContent(type="text", text=str(part)))
 
         if len(content_parts) == 1:

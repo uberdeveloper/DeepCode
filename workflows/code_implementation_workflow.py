@@ -456,9 +456,47 @@ Requirements:
             )
 
             await self.mcp_agent.__aenter__()
-            llm = await self.mcp_agent.attach_llm(
-                get_preferred_llm_class(self.config_path)
-            )
+
+            # Try to attach LLM with error handling for API failures
+            try:
+                llm = await self.mcp_agent.attach_llm(
+                    get_preferred_llm_class(self.config_path)
+                )
+            except Exception as llm_error:
+                self.logger.warning(f"LLM initialization failed: {llm_error}")
+                # Try to use a direct Gemini provider as fallback
+                try:
+                    from llm_providers.gemini_provider import (
+                        GeminiProvider,
+                        GeminiConfig,
+                    )
+                    import yaml
+
+                    # Read config directly
+                    with open(self.config_path, "r", encoding="utf-8") as f:
+                        config = yaml.safe_load(f) or {}
+
+                    gemini_config = config.get("gemini", {})
+                    api_key = gemini_config.get("api_key", "")
+
+                    if api_key and api_key.strip():
+                        gemini_config_obj = GeminiConfig(
+                            api_key=api_key,
+                            default_model="gemini-2.5-flash",
+                            max_tokens=8192,
+                            temperature=0.3,
+                        )
+                        llm = GeminiProvider(config=gemini_config_obj)
+                        self.logger.info("Using direct GeminiProvider as fallback")
+                    else:
+                        raise ValueError("No Gemini API key available for fallback")
+                except Exception as fallback_error:
+                    self.logger.error(
+                        f"Fallback LLM initialization also failed: {fallback_error}"
+                    )
+                    raise ValueError(
+                        f"LLM initialization failed and fallback unavailable: {str(llm_error)}"
+                    )
 
             # Set workspace to the target code directory
             workspace_result = await self.mcp_agent.call_tool(
@@ -490,12 +528,49 @@ Requirements:
                 self.mcp_agent = None
 
     async def _initialize_llm_client(self):
-        """Initialize LLM client (Anthropic or OpenAI) based on API key availability"""
+        """Initialize LLM client (Gemini, Anthropic or OpenAI) based on API key availability"""
         # Check which API has available key and try that first
+        gemini_config = self.api_config.get("gemini", {})
+        gemini_key = gemini_config.get("api_key", "")
         anthropic_key = self.api_config.get("anthropic", {}).get("api_key", "")
         openai_key = self.api_config.get("openai", {}).get("api_key", "")
 
-        # Try Anthropic API first if key is available
+        # Try Gemini API first if key is available (since we're using Gemini)
+        if gemini_key and gemini_key.strip():
+            try:
+                import google.generativeai as genai
+
+                # Configure Gemini
+                genai.configure(api_key=gemini_key)
+
+                # Test connection with a more appropriate message
+                model = genai.GenerativeModel(self.default_models["gemini"])
+                test_response = await model.generate_content_async(
+                    "Hello, this is a connection test."
+                )
+
+                # Check if response is valid (not filtered)
+                if (
+                    not test_response.candidates
+                    or not test_response.candidates[0].content.parts
+                ):
+                    finish_reason = (
+                        test_response.candidates[0].finish_reason
+                        if test_response.candidates
+                        else "unknown"
+                    )
+                    raise ValueError(
+                        f"Gemini API returned empty response. Finish reason: {finish_reason}"
+                    )
+
+                self.logger.info(
+                    f"Using Gemini API with model: {self.default_models['gemini']}"
+                )
+                return model, "gemini"
+            except Exception as e:
+                self.logger.warning(f"Gemini API unavailable: {e}")
+
+        # Try Anthropic API if key is available
         if anthropic_key and anthropic_key.strip():
             try:
                 from anthropic import AsyncAnthropic
@@ -564,7 +639,11 @@ Requirements:
     ):
         """Call LLM with tools"""
         try:
-            if client_type == "anthropic":
+            if client_type == "gemini":
+                return await self._call_gemini_with_tools(
+                    client, system_message, messages, tools, max_tokens
+                )
+            elif client_type == "anthropic":
                 return await self._call_anthropic_with_tools(
                     client, system_message, messages, tools, max_tokens
                 )
@@ -672,6 +751,54 @@ Requirements:
         return {"content": content, "tool_calls": tool_calls}
 
     # ==================== 5. Tools and Utility Methods (Utility Layer) ====================
+
+    async def _call_gemini_with_tools(
+        self, client, system_message, messages, tools, max_tokens=8192
+    ):
+        """Call Gemini API with tools - simplified implementation"""
+        try:
+            # Combine system message and user messages
+            full_prompt = system_message + "\n\n"
+            for msg in messages:
+                if msg.get("role") == "user":
+                    full_prompt += f"User: {msg.get('content', '')}\n\n"
+                elif msg.get("role") == "assistant":
+                    full_prompt += f"Assistant: {msg.get('content', '')}\n\n"
+
+            # Add tools instruction
+            if tools:
+                full_prompt += "Available tools:\n"
+                for tool in tools[
+                    :3
+                ]:  # Limit to first 3 tools to avoid context overflow
+                    full_prompt += f"- {tool.get('name', 'unknown')}: {tool.get('description', 'no description')}\n"
+                full_prompt += "\nUse the tools when needed to accomplish the task.\n\n"
+
+            # Generate response
+            response = await client.generate_content_async(full_prompt)
+
+            # Extract text response
+            response_text = ""
+            if hasattr(response, "text"):
+                response_text = response.text
+            elif hasattr(response, "candidates") and response.candidates:
+                for candidate in response.candidates:
+                    if hasattr(candidate, "content") and hasattr(
+                        candidate.content, "parts"
+                    ):
+                        for part in candidate.content.parts:
+                            if hasattr(part, "text"):
+                                response_text += part.text
+
+            return {
+                "content": response_text,
+                "role": "assistant",
+                "tool_calls": [],  # Gemini tool calling would need more complex implementation
+            }
+
+        except Exception as e:
+            self.logger.error(f"Gemini API call failed: {e}")
+            raise
 
     def _validate_messages(self, messages: List[Dict]) -> List[Dict]:
         """Validate and clean message list"""

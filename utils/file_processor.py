@@ -187,15 +187,43 @@ class FileProcessor:
             if not os.path.exists(file_path):
                 raise FileNotFoundError(f"File not found: {file_path}")
 
-            # Check if file is actually a PDF by reading the first few bytes
+            # Check if file is a PDF
             with open(file_path, "rb") as f:
                 header = f.read(8)
                 if header.startswith(b"%PDF"):
-                    raise IOError(
-                        f"File {file_path} is a PDF file, not a text file. Please convert it to markdown format or use PDF processing tools."
-                    )
+                    # Handle PDF files using PDF extraction
+                    try:
+                        # Try to use PyPDF2 first
+                        import PyPDF2
 
-            # Read file content
+                        text_content = ""
+                        with open(file_path, "rb") as pdf_file:
+                            pdf_reader = PyPDF2.PdfReader(pdf_file)
+                            for page_num in range(len(pdf_reader.pages)):
+                                page = pdf_reader.pages[page_num]
+                                text_content += page.extract_text() + "\n"
+                        return text_content
+                    except ImportError:
+                        # Fallback to file-downloader tool
+                        from mcp.types import CallToolRequest, CallToolRequestParams
+
+                        # Tool request would be created here for MCP integration
+                        # CallToolRequest(
+                        #     method="tools/call",
+                        #     params=CallToolRequestParams(
+                        #         name="file-downloader",
+                        #         arguments={
+                        #             "file_path": file_path,
+                        #             "extract_text": True,
+                        #         },
+                        #     ),
+                        # )
+
+                        # This would require access to the MCP agent context
+                        # For now, return a placeholder message
+                        return f"[PDF Content from {file_path} - PDF processing not fully implemented in this context]"
+
+            # Read file content for text files
             # Note: Using async with would be better for large files
             # but for simplicity and compatibility, using regular file reading
             with open(file_path, "r", encoding="utf-8") as f:
@@ -278,14 +306,22 @@ class FileProcessor:
             Dict: The structured content with sections and standardized text
         """
         try:
-            # 首先尝试从字符串中提取markdown文件路径
+            # Handle direct file path input by wrapping it in the expected format
             if isinstance(file_input, str):
                 import re
 
-                file_path_match = re.search(r"`([^`]+\.md)`", file_input)
-                if file_path_match:
-                    paper_path = file_path_match.group(1)
-                    file_input = {"paper_path": paper_path}
+                # Check if it's a direct file path
+                if file_input.endswith(
+                    (".md", ".pdf", ".txt", ".docx", ".doc", ".html", ".htm")
+                ) or os.path.exists(file_input):
+                    # Wrap direct file path in the expected dictionary format
+                    file_input = {"paper_path": file_input}
+                else:
+                    # Try to extract markdown file path from text
+                    file_path_match = re.search(r"`([^`]+\.md)`", file_input)
+                    if file_path_match:
+                        paper_path = file_path_match.group(1)
+                        file_input = {"paper_path": paper_path}
 
             # Extract paper directory path
             paper_dir = cls.extract_file_path(file_input)

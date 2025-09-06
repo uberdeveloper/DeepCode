@@ -42,7 +42,8 @@ from mcp.types import (
 
 
 class GeminiSettings(BaseModel):
-    api_key: str
+    api_key: str = ""
+    default_model: str = "gemini-1.5-flash"
 
 
 class RequestCompletionRequest(BaseModel):
@@ -64,10 +65,12 @@ class GeminiAugmentedLLM(AugmentedLLM[dict, dict]):
         self.provider = "Gemini"
         self.logger = get_logger(f"{__name__}.{self.name}" if self.name else __name__)
 
-        default_model = "gemini-1.5-flash"
-        if self.context and self.context.config and hasattr(self.context.config, "gemini"):
-            if hasattr(self.context.config.gemini, "default_model"):
-                default_model = self.context.config.gemini.default_model
+        gemini_config_dict = self.context.config.get("gemini", {})
+        if self.context.secrets and "gemini" in self.context.secrets:
+            gemini_config_dict.update(self.context.secrets["gemini"])
+        self.gemini_settings = GeminiSettings(**gemini_config_dict)
+
+        default_model = self.gemini_settings.default_model
 
         self.default_request_params = self.default_request_params or RequestParams(
             model=default_model,
@@ -119,7 +122,7 @@ class GeminiAugmentedLLM(AugmentedLLM[dict, dict]):
             finish_reasons = []
 
             for i in range(params.max_iterations):
-                genai.configure(api_key=self.context.secrets.gemini["api_key"])
+                genai.configure(api_key=self.gemini_settings.api_key)
                 gemini_model = genai.GenerativeModel(
                     model_name=model,
                     tools=available_tools,
@@ -153,9 +156,9 @@ class GeminiAugmentedLLM(AugmentedLLM[dict, dict]):
         responses = await self.generate(message=message, request_params=request_params)
         final_text: List[str] = []
         for response in responses:
-            for part in response['parts']:
-                if 'text' in part:
-                    final_text.append(part['text'])
+            for part in response.parts:
+                if part.text:
+                    final_text.append(part.text)
         return "\n".join(final_text)
 
     async def generate_structured(self, message, response_model: Type[ModelT], request_params: RequestParams | None = None) -> ModelT:
@@ -164,8 +167,8 @@ class GeminiAugmentedLLM(AugmentedLLM[dict, dict]):
         return response_model.model_validate_json(response)
 
     async def execute_tool_call(self, tool_call: dict):
-        tool_name = tool_call['name']
-        tool_args = dict(tool_call['args'])
+        tool_name = tool_call.name
+        tool_args = dict(tool_call.args)
         tool_call_id = "N/A"  # Gemini doesn't provide a tool_call_id
 
         tool_call_request = CallToolRequest(
@@ -182,28 +185,39 @@ class GeminiAugmentedLLM(AugmentedLLM[dict, dict]):
 
 class MCPGeminiTypeConverter(ProviderToMCPConverter[dict, dict]):
     @classmethod
-    def from_mcp_message_param(cls, param: MCPMessageParam) -> List[dict]:
-        if isinstance(param, list):
-            return [cls.from_mcp_message_param_single(p) for p in param]
-        else:
-            return [cls.from_mcp_message_param_single(param)]
+    def from_mcp_message_param(cls, message: MessageTypes) -> List[dict]:
+        if isinstance(message, str):
+            return [{"role": "user", "parts": [{"text": message}]}]
+        if isinstance(message, dict):
+            return [cls.from_mcp_message_param_single(message)]
+        if isinstance(message, list):
+            result = []
+            for item in message:
+                if isinstance(item, str):
+                    result.append({"role": "user", "parts": [{"text": item}]})
+                elif isinstance(item, dict):
+                    result.append(cls.from_mcp_message_param_single(item))
+            return result
+        raise TypeError(f"Unsupported message type: {type(message)}")
 
     @classmethod
-    def from_mcp_message_param_single(cls, param: MCPMessageParam) -> dict:
-        if param.role == "user":
-            role = "user"
-        else:
-            role = "model"
+    def from_mcp_message_param_single(cls, param: dict) -> dict:
+        role = "user" if param.get("role") == "user" else "model"
+        content = param.get("content")
 
-        if isinstance(param.content, TextContent):
-            return {"role": role, "parts": [{"text": param.content.text}]}
-        # Add more content types if needed
-        return {"role": role, "parts": [{"text": str(param.content)}]}
+        if hasattr(content, 'text'):
+            text = content.text
+        elif isinstance(content, str):
+            text = content
+        else:
+            text = str(content)
+
+        return {"role": role, "parts": [{"text": text}]}
 
     @classmethod
     def to_mcp_message_result(cls, result: dict) -> MCPMessageResult:
         text_content = ""
-        for part in result['parts']:
+        for part in result.get('parts', []):
             if 'text' in part:
                 text_content += part['text']
 

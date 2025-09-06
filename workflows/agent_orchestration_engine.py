@@ -36,7 +36,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # MCP Agent imports
 from mcp_agent.agents.agent import Agent
 from mcp_agent.workflows.llm.augmented_llm import RequestParams
-from mcp_agent.workflows.parallel.parallel_llm import ParallelLLM
 
 # Local imports
 from prompts.code_prompts import (
@@ -222,11 +221,45 @@ async def run_research_analyzer(prompt_text: str, logger) -> str:
                 print(f"Failed to list tools: {e}")
 
             try:
-                analyzer = await analyzer_agent.attach_llm(get_preferred_llm_class())
-                print("✅ LLM attached successfully")
+                # Use GeminiProvider directly to bypass configuration schema validation
+                from llm_providers.gemini_provider import GeminiProvider, GeminiConfig
+                import yaml
+
+                # Read API key directly from secrets file
+                with open("mcp_agent.secrets.yaml", "r", encoding="utf-8") as f:
+                    secrets = yaml.safe_load(f) or {}
+
+                gemini_config = secrets.get("gemini", {})
+                api_key = gemini_config.get("api_key", "")
+
+                if api_key and api_key.strip():
+                    gemini_config_obj = GeminiConfig(
+                        api_key=api_key,
+                        default_model="gemini-2.5-flash",
+                        max_tokens=8192,
+                        temperature=0.3,
+                    )
+                    analyzer = GeminiProvider(config=gemini_config_obj)
+                    print(
+                        "✅ GeminiProvider attached successfully (bypassing schema validation)"
+                    )
+                else:
+                    # Fall back to preferred LLM selection
+                    analyzer = await analyzer_agent.attach_llm(
+                        get_preferred_llm_class()
+                    )
+                    print("✅ LLM attached successfully (fallback)")
             except Exception as e:
                 print(f"❌ Failed to attach LLM: {e}")
-                raise
+                # Try fallback to original method
+                try:
+                    analyzer = await analyzer_agent.attach_llm(
+                        get_preferred_llm_class()
+                    )
+                    print("✅ LLM attached successfully (fallback)")
+                except Exception as fallback_e:
+                    print(f"❌ Fallback also failed: {fallback_e}")
+                    raise
 
             # Set higher token output for research analysis
             analysis_params = RequestParams(
@@ -376,31 +409,56 @@ async def run_code_analyzer(
         server_names=agent_config["code_planner"],
     )
 
-    code_aggregator_agent = ParallelLLM(
-        fan_in_agent=code_planner_agent,
-        fan_out_agents=[concept_analysis_agent, algorithm_analysis_agent],
-        llm_factory=get_preferred_llm_class(),
-    )
-
     # Set appropriate token output limit for Claude models (max 8192)
     enhanced_params = RequestParams(
         max_tokens=8192,  # Adjusted to Claude 3.5 Sonnet's actual limit
         temperature=0.3,
     )
 
-    # Concise message for multi-agent paper analysis and code planning
-    message = f"""Analyze the research paper in directory: {paper_dir}
+    # Sequential approach to avoid ParallelLLM aggregation issues
+    print("🔍 Running concept analysis...")
+    concept_message = f"""Analyze the research paper in directory: {paper_dir}
 
-Please locate and analyze the markdown (.md) file containing the research paper. Based on your analysis, generate a comprehensive code reproduction plan that includes:
+Please focus on system architecture and conceptual framework. What are the main components, overall architecture, and high-level design patterns?
 
+Please locate and analyze the markdown (.md) file containing the research paper."""
+
+    concept_llm = await concept_analysis_agent.attach_llm(get_preferred_llm_class())
+    concept_result = await concept_llm.generate_str(
+        message=concept_message, request_params=enhanced_params
+    )
+
+    print("🔍 Running algorithm analysis...")
+    algorithm_message = f"""Analyze the research paper in directory: {paper_dir}
+
+Please focus on extracting algorithms, formulas, and technical implementation details. What are the key mathematical models, computational methods, and algorithms described?
+
+Please locate and analyze the markdown (.md) file containing the research paper."""
+
+    algorithm_llm = await algorithm_analysis_agent.attach_llm(get_preferred_llm_class())
+    algorithm_result = await algorithm_llm.generate_str(
+        message=algorithm_message, request_params=enhanced_params
+    )
+
+    print("🏗️ Generating comprehensive implementation plan...")
+    planning_message = f"""Based on the following analysis results, generate a comprehensive code reproduction plan:
+
+CONCEPT ANALYSIS:
+{concept_result}
+
+ALGORITHM ANALYSIS:
+{algorithm_result}
+
+Please create a detailed implementation plan that includes:
 1. Complete system architecture and component breakdown
 2. All algorithms, formulas, and implementation details
 3. Detailed file structure and implementation roadmap
 
 The goal is to create a reproduction plan detailed enough for independent implementation."""
 
-    result = await code_aggregator_agent.generate_str(
-        message=message, request_params=enhanced_params
+    planning_llm = await code_planner_agent.attach_llm(get_preferred_llm_class())
+    result = await planning_llm.generate_str(
+        message=planning_message, request_params=enhanced_params
     )
     print(f"Code analysis result: {result}")
     return result
@@ -489,11 +547,27 @@ async def _process_input_source(input_source: str, logger) -> str:
     Returns:
         str: Processed input source
     """
+    # Handle JSON format (from Streamlit UI)
+    if input_source.startswith("{") and input_source.endswith("}"):
+        try:
+            import json
+            data = json.loads(input_source)
+            if "paper_path" in data:
+                file_path = data["paper_path"]
+                logger.info(f"Extracted paper_path from JSON: {file_path}")
+                return file_path
+        except json.JSONDecodeError:
+            # If JSON parsing fails, continue with original processing
+            pass
+    
+    # Handle file:// protocol
     if input_source.startswith("file://"):
         file_path = input_source[7:]
         if os.name == "nt" and file_path.startswith("/"):
             file_path = file_path.lstrip("/")
         return file_path
+    
+    # Return as-is if it's already a file path or URL
     return input_source
 
 
@@ -1035,6 +1109,56 @@ async def synthesize_code_implementation_agent(
         # Check if initial plan file exists
         if os.path.exists(dir_info["initial_plan_path"]):
             print(f"Using initial plan from {dir_info['initial_plan_path']}")
+
+            # Create file tree structure first (required before code implementation)
+            print("🌳 Creating file tree structure...")
+            code_directory = os.path.join(dir_info["paper_dir"], "generate_code")
+
+            try:
+                # Ensure the target directory exists
+                os.makedirs(code_directory, exist_ok=True)
+
+                # Try to create file structure using the workflow
+                with open(dir_info["initial_plan_path"], "r", encoding="utf-8") as f:
+                    plan_content = f.read()
+
+                structure_result = await code_workflow.create_file_structure(
+                    plan_content=plan_content, target_directory=dir_info["paper_dir"]
+                )
+
+                if (
+                    structure_result
+                    and os.path.exists(code_directory)
+                    and len(os.listdir(code_directory)) > 0
+                ):
+                    print("✅ File tree structure created successfully!")
+                else:
+                    print(
+                        "⚠️ File tree structure creation had issues, creating minimal structure..."
+                    )
+                    # Create a minimal file structure to proceed
+                    os.makedirs(os.path.join(code_directory, "src"), exist_ok=True)
+                    os.makedirs(os.path.join(code_directory, "data"), exist_ok=True)
+                    os.makedirs(os.path.join(code_directory, "configs"), exist_ok=True)
+                    os.makedirs(os.path.join(code_directory, "scripts"), exist_ok=True)
+
+                    # Create basic __init__.py files
+                    with open(
+                        os.path.join(code_directory, "src", "__init__.py"), "w"
+                    ) as f:
+                        f.write("# DeepCode Project\n")
+
+                    print("✅ Minimal file tree structure created!")
+            except Exception as e:
+                print(f"⚠️ Error creating file tree structure: {e}")
+                # Create fallback structure
+                try:
+                    os.makedirs(code_directory, exist_ok=True)
+                    os.makedirs(os.path.join(code_directory, "src"), exist_ok=True)
+                    os.makedirs(os.path.join(code_directory, "data"), exist_ok=True)
+                    print("✅ Fallback file tree structure created!")
+                except Exception as e2:
+                    print(f"❌ Failed to create fallback structure: {e2}")
 
             # Run code implementation workflow with pure code mode
             implementation_result = await code_workflow.run_workflow(

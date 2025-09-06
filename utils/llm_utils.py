@@ -12,7 +12,7 @@ from typing import Any, Type, Dict, Tuple
 # Import LLM classes
 from mcp_agent.workflows.llm.augmented_llm_anthropic import AnthropicAugmentedLLM
 from mcp_agent.workflows.llm.augmented_llm_openai import OpenAIAugmentedLLM
-from utils.gemini_llm import GeminiAugmentedLLM
+from llm_providers.gemini_provider import GeminiProvider
 
 
 def get_preferred_llm_class(config_path: str = "mcp_agent.secrets.yaml") -> Type[Any]:
@@ -33,10 +33,12 @@ def get_preferred_llm_class(config_path: str = "mcp_agent.secrets.yaml") -> Type
             with open(config_path, "r", encoding="utf-8") as f:
                 config = yaml.safe_load(f) or {}
 
+            # Check for Gemini API key directly without configuration validation
             gemini_config = config.get("gemini", {})
             gemini_key = gemini_config.get("api_key", "")
             if gemini_key and gemini_key.strip():
-                return GeminiAugmentedLLM
+                print("🤖 Using GeminiProvider (bypassing schema validation)")
+                return GeminiProvider
 
             anthropic_config = config.get("anthropic", {})
             anthropic_key = anthropic_config.get("api_key", "")
@@ -78,16 +80,28 @@ def get_default_models(config_path: str = "mcp_agent.config.yaml"):
                 "default_model", "claude-sonnet-4-20250514"
             )
             openai_model = openai_config.get("default_model", "o3-mini")
-            gemini_model = gemini_config.get("default_model", "gemini-1.5-flash")
+            gemini_model = gemini_config.get("default_model", "gemini-2.5-flash")
 
-            return {"anthropic": anthropic_model, "openai": openai_model, "gemini": gemini_model}
+            return {
+                "anthropic": anthropic_model,
+                "openai": openai_model,
+                "gemini": gemini_model,
+            }
         else:
             print(f"Config file {config_path} not found, using default models")
-            return {"anthropic": "claude-sonnet-4-20250514", "openai": "o3-mini", "gemini": "gemini-1.5-flash"}
+            return {
+                "anthropic": "claude-sonnet-4-20250514",
+                "openai": "o3-mini",
+                "gemini": "gemini-2.5-flash",
+            }
 
     except Exception as e:
         print(f"❌Error reading config file {config_path}: {e}")
-        return {"anthropic": "claude-sonnet-4-20250514", "openai": "o3-mini", "gemini": "gemini-1.5-flash"}
+        return {
+            "anthropic": "claude-sonnet-4-20250514",
+            "openai": "o3-mini",
+            "gemini": "gemini-2.5-flash",
+        }
 
 
 def get_document_segmentation_config(
